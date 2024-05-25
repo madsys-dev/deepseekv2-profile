@@ -133,7 +133,7 @@ class DeepseekAttention(nn.Module):
         k_pe = apply_rotary_pos_emb(k_pe, cos, sin, kv_position_ids).view(bsz, kv_seq_len, self.qk_rope_head_dim)
         return torch.cat([compressed_kv, k_pe],dim=-1)
     
-    def forward(self, hidden_states_q: torch.Tensor, compressed_kv: torch.Tensor, q_position_ids: torch.LongTensor):
+    def forward(self, hidden_states_q: torch.Tensor, q_position_ids: torch.LongTensor, compressed_kv: torch.Tensor):
         '''
         Attention masks and past cache are removed.
 

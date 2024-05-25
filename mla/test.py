@@ -10,7 +10,7 @@ import math
 
 torch.set_grad_enabled(False)
 
-cfg = DeepseekV2Config.from_json_file('baseline/config.json')
+cfg = DeepseekV2Config.from_json_file('mla/config.json')
 
 cfg_dict = cfg.to_dict()
 cfg_dict['torch_dtype'] = cfg.torch_dtype
@@ -59,7 +59,7 @@ print(f'CacheDecomporessed: Relative L2 error={l2e}, Relative Linf error={linfe}
 cache_compressed = AttentionCacheCompressed(**cfg_dict).cuda()
 cache_compressed.load_state_dict(state_dict)
 compressed = cache_compressed.compress_kv(fixture.kv, fixture.kv_pos)
-result = cache_compressed(fixture.q, compressed, fixture.q_pos)
+result = cache_compressed(fixture.q, fixture.q_pos, compressed)
 l2e, linfe = compute_error(std_result, result)
 print(f'CacheComporessed: Relative L2 error={l2e}, Relative Linf error={linfe}')
 
@@ -72,6 +72,6 @@ print(f'Absorbed: Relative L2 error={l2e}, Relative Linf error={linfe}')
 absorbed_cache_compressed = AttentionAbsorbedCacheCompressed(**cfg_dict).cuda()
 absorbed_cache_compressed.load_state_dict(state_dict)
 compressed = absorbed_cache_compressed.compress_kv(fixture.kv, fixture.kv_pos)
-result = absorbed_cache_compressed(fixture.q, compressed, fixture.q_pos)
+result = absorbed_cache_compressed(fixture.q, fixture.q_pos, compressed)
 l2e, linfe = compute_error(std_result, result)
 print(f'AbsorbedCacheCompressed: Relative L2 error={l2e}, Relative Linf error={linfe}')
