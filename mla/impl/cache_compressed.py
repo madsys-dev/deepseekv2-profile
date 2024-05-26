@@ -149,6 +149,9 @@ class DeepseekAttention(nn.Module):
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
+        cos, sin = self.rotary_emb(q_pe)
+        q_pe = apply_rotary_pos_emb(q_pe, cos, sin, q_position_ids)
+
         kv_seq_len = compressed_kv.size(1)
         compressed_kv, k_pe = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -159,18 +162,19 @@ class DeepseekAttention(nn.Module):
             .transpose(1, 2)
         
         k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        cos, sin = self.rotary_emb(value_states)
-        q_pe = apply_rotary_pos_emb(q_pe, cos, sin, q_position_ids)
 
-        query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
-        query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
-        query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
+        # query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+        # query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+        # query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
 
-        key_states = k_pe.new_empty(bsz, self.num_heads, kv_seq_len, self.q_head_dim)
-        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
+        # key_states = k_pe.new_empty(bsz, self.num_heads, kv_seq_len, self.q_head_dim)
+        # key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
+        # key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
+        # avoid copying key-states
+        attn_weights = torch.matmul(q_nope, k_nope.transpose(2, 3)) + torch.matmul(q_pe, k_pe.transpose(2, 3))
+        # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
+        attn_weights *= self.softmax_scale
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -181,7 +185,7 @@ class DeepseekAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(
             attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
+        ).to(q_pe.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
