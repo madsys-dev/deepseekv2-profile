@@ -4,9 +4,9 @@
 
 最近，幻方发布的DeepSeek-V2模型得到了学术界和产业界的广泛关注。作为一款236B参数的MoE大模型，DeepSeek-V2通过独特的DeepSeekMoE架构设计，每token仅需激活21B的参数，且通过新提出的MLA机制替换传统的MHA和MQA注意力机制，实现了推理过程中的KV Cache大小的大幅降低。因此，DeepSeek-V2能够以较低的推理成本，取得了与GPT-4相当的模型性能。
 
-MLA机制是DeepSeek-V2中的一个核心创新点。作为计算机系统方向的研究人员，我们自然不敢从AI/ML的角度对MLA的算法设计妄加评论。然而，从System的角度来看，MLA无疑是一个非常优秀的设计。近年来，大模型推理成本居高不下的一大原因就是GPU的算力利用率低下。由于Tensor Core等专门电路的的出现，现代GPU的计算能力已经远强于其内存带宽，GPU每读入的一个字节的数据，往往要参与到数百次计算中，才能保证GPU取得较好的计算资源利用率（即MFU）。然而，大模型推理的任务负载通常难以提供如此高的计算强度，即GPU读入的参数未参与足够多次的计算便要被丢弃而读入下一个参数，这导致显存带宽成为了整个推理过程的性能瓶颈。这其中的一大障碍就是KV Cache的空间占用问题：GPU的显存空间往往非常有限，较大的KV Cache会导致同时处理的request数量变少，也即batch size较小；以vLLM为代表的一众工作就是从这个角度入手，优化KV Cache的显存利用率，从而提高推理过程的硬件资源利用率。另一方面，针对传统的MHA或GQA算子，在计算注意力的过程中，所有KV Cache中的数据读取后都仅参与一次或几次计算，导致该算子的MFU极低，并且由于每个request有自己的KV Cache，这一问题无法通过提高batch size的方式解决。而MLA算子，从其计算特征来看，同时解决了这两方面的问题：一方面，通过低秩压缩大幅降低了KV Cache的大小，另一方面，MLA解压缩后的多头注意力机制能够提供较高的计算强度，有助于充分利用GPU的算力资源。很明显，MLA算子是针对现代GPU硬件特点“量体裁衣”定制的一个注意力机制，通过对存储和计算的再平衡，能够充分发挥现代GPU的各项优势。
+MLA机制是DeepSeek-V2中的一个核心创新点。作为计算机系统方向的研究人员，我们自然不敢从AI/ML的角度对MLA的算法设计妄加评论，但从System的角度来看，MLA无疑是一个非常优秀的设计。近年来，大模型推理成本居高不下的一大原因就是GPU的算力利用率低下。随着Tensor Core等专门电路的的出现，现代高性能GPU的计算能力已经远高于其内存带宽，GPU每读入的一个字节的数据，往往要参与到数百次计算中，才能保证GPU的计算单元不会空闲，从而取得较好的计算资源利用率（即MFU）。然而，由于多种因素的限制，大模型推理的任务负载通常难以提供如此高的计算强度，即GPU读入的参数未参与足够多次的计算便要被丢弃而读入下一个参数，这导致显存带宽成为了整个推理过程的性能瓶颈。这其中的一大障碍就是KV Cache的空间占用问题：GPU的显存空间往往非常有限，较大的KV Cache会导致同时处理的request数量变少，也即batch size较小；以vLLM为代表的一众工作就是从这个角度入手，优化KV Cache的显存利用，从而提高推理过程的效率。另一方面，针对传统的MHA或GQA算子，在计算注意力的过程中，所有KV Cache中的数据读取后都仅参与一次或几次计算，导致该算子的MFU极低，并且由于每个request有自己的KV Cache，这一问题无法通过提高batch size的方式解决。而MLA算子，从其计算特征来看，同时解决了这两方面的问题：一方面，通过低秩压缩大幅降低了KV Cache的大小，另一方面，MLA解压缩后的多头注意力机制能够提供较高的计算强度，有助于充分利用GPU的算力资源。很明显，MLA算子是针对现代GPU硬件特点“量体裁衣”定制的一个注意力机制，通过对存储和计算的再平衡，能够充分发挥现代GPU的各项优势。
 
-DeepSeek-V2开源的代码中未对MLA算子进行过多的优化。我们尝试复现了一些MLA算子在推理阶段可能涉及的优化点，并对其进行了评测和分析。
+DeepSeek-V2开源的代码中未对MLA算子进行过多的优化。我们尝试复现了一些MLA算子在推理阶段（具体来说，是推理阶段中的decoding阶段）可能涉及的优化点，并对其进行了评测和分析。
 
 ## MLA算子的计算过程
 
@@ -46,12 +46,13 @@ $$ v_t = W^{UV} c_t^{KV} \in \mathbb{R}^{B \times L \times H \times 128} $$
 ### Attention计算
 
 Attention的计算过程和传统的MHA并无差异。首先计算attention score：
-$$ a = (q_t^\top k_t + \mathrm{Mask}) / \sqrt{192} = ({q_t^C}^\top k_t^C + {q_t^R}^\top k_t^R + \mathrm{Mask}) / \sqrt{128 + 64}\in \mathbb{R}^{B \times L \times H \times L} $$
-对a的最后一维做softmax，并计算对V的加权和，得到Attention输出：
-$$ o = \mathrm{softmax}(a) v_t \in \mathbb{R}^{B \times L \times H \times 128} $$
-经过另一个矩阵的投影，得到MLA的最终输出：
+$$ a = \mathrm{softmax}\left(\frac{q_t^\top k_t + \mathrm{Mask}}{\sqrt{192}}\right) = 
+\mathrm{softmax}\left(\frac{{q_t^C}^\top k_t^C + {q_t^R}^\top k_t^R + \mathrm{Mask}}{\sqrt{128 + 64}} \right)
+\in \mathbb{R}^{B \times L \times H \times L} $$
+计算对V的加权和，并将所有head压平，得到Attention输出：
+$$ o = a \cdot v_t \in \mathbb{R}^{B \times L \times H \times 128} \cong \mathbb{R}^{B \times L \times 16384} $$
+经过另一个矩阵的投影，就能得到MLA的最终输出：
 $$ u = W^o o \in \mathbb{R}^{B \times L \times 5120} $$
-
 
 ## 开源代码MLA算子分析
 
@@ -110,19 +111,40 @@ def forward(...):
 
 ## MLA实现优化
 
-### Caching Compressed KV
+### KV Caching
 
 在原始的transformer计算过程中，每次都需要计算完整的KV向量，这部分的计算往往会带来较大的开销。实际上，每次模型迭代过程中，这些KV向量的值都是一样的。因此，我们可以采用“空间换时间”的策略，将先前迭代过程中KV向量的值缓存下来，这样在后续的迭代过程中，就不需要重复计算KV向量了，从而大大减小了模型推理过程中的计算量。
 
 然而，在以MHA为代表的传统Attention算子中，这种空间换时间的策略往往会矫枉过正。由于KV cache占用的空间很大，并且KV cache中的数据在每次迭代过程中仅参与一次计算，在使用KV cache后，虽然计算量减小了，但是显存占用量以及显存带宽需求却急剧上升，成为了制约大模型推理效率的新瓶颈。MLA的设计通过多头共用压缩后的KV表示，一方面大幅减少了KV cache的占用，另一方面，由于Compressed KV在每个head中都参与了计算，DeepSeek-V2的128个heads能够提供足够的计算强度，因此Attention部分的MFU也得到了大幅提高。
 
-在开源的版本中， MLA算子了完整的KV Cache，丧失了MLA的上述种种好处。我们尝试改为缓存压缩后的KV Cache，并与缓存完整的KV Cache进行对比。此外我们还实现了一个不缓存任何KV Cache的版本作为Baseline。各种实现的KV Cache占用和计算量如下：
+在开源的版本中， MLA算子了完整的KV Cache，丧失了MLA的上述种种好处。我们尝试改为缓存压缩后的KV Cache，并与缓存完整的KV Cache进行对比。
+
+``` python
+# CacheCompressed
+def forward(self, hidden_states_q: torch.Tensor, q_position_ids: torch.LongTensor, compressed_kv: torch.Tensor):
+    ...
+    kv_seq_len = compressed_kv.size(1)
+    compressed_kv, k_pe = torch.split(
+        compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+    )
+    k_pe = k_pe.view(bsz, kv_seq_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+    kv = self.kv_b_proj(compressed_kv) \
+        .view(bsz, kv_seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim) \
+        .transpose(1, 2)
+    
+    k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+    ... 
+```
+
+另外，我们还实现了一个不缓存任何KV Cache的版本作为Baseline。各种实现的KV Cache占用和计算量如下表：
 
 | 实现版本 | 每token每层Cache大小 | 每token每层计算量 |
 | :---: | :---: | :---: |
-| Baseline | 0 | 19.77 MFLOP |
-| CacheDecompressed | 81.92 kB | 0.04 MFLOP |
-| CacheCompressed | 1.152 kB | 16.82 MFLOP |
+| Baseline | 0 | 39.53 MFLOP |
+| CacheDecompressed (CD) | 81.92 kB | 0.08 MFLOP |
+| CacheCompressed (CC) | 1.152 kB | 33.64 MFLOP |
+
+可以看到，CacheDecompressed策略虽然可以节省几乎全部的浮点计算量，但其显存占用量却达到了81.92kB每token。这使得CacheDecompressed的瓶颈很容易卡在显存容量和显存带宽上。而CacheCompressed的策略虽然相比Baseline只能节省大约15%的浮点计算量，但是显存占用却少了约98.6%。因此，我们可以期望CacheCompressed策略能够更加均衡的利用GPU的各项硬件能力，并且提供更大的batch size，从而降低推理成本。
 
 我们分别在A100-PCIe-40G（Compute80架构）和GeForce RTX 4080（Compute89架构）上对上述实现进行性能测试。对于单个request，各种实现的性能表现如下图所示：
 
@@ -141,6 +163,38 @@ def forward(...):
 上述分析和实验结果表明，相比缓存完整的KV Cache，缓存压缩后的KV Cache会带来较大的性能下降。另外一个重要的问题是，当前的CacheDecompressed实现实际上并不能缓解KV Cache过大的问题，这是由于在计算MLA的时候，仍然需要存储解压后的完整的KV Cache，这很可能引起OOM崩溃。
 
 所幸DeepSeek-V2的论文中提出，可以将KV的解压缩矩阵吸收到Q-projection和Out-projection中，从而可以在不解压缩KV Cache的情况下直接计算最终的Attention结果。
+对于K的吸收，在Attention Score的计算公式中，非RoPE部分可以做如下展开：
+$$
+{q_t^C}^\top k_t^C = (W^{UQ} c_t^Q)^{\top} W^{UK} c_t^{KV} = {c_t^Q}^{\top}{W^{UQ}}^{\top} W^{UK} c_t^{KV} = ({c_t^Q}^{\top}{W^{UQ}}^{\top} W^{UK}) c_t^{KV} 
+$$
+即通过矩阵乘法结合律，可以改为计算$({c_t^Q}^{\top}{W^{UQ}}^{\top} W^{UK})$，避免了解压缩出完整的K矩阵。此外，在原始版本的解压缩的过程中，由于每个token的key都需要与$W^{UK}$相乘才能得到，因此计算量较大；矩阵吸收后，$W^{UK}$只需要对$q_t^C$这一个向量相乘，也大大减少了浮点计算量。
+
+对于V的吸收，情况稍微复杂。为表述的清楚性，我们采用Einsten求和约定描述该过程：
+``` python
+v_t = einsum('hdc,blc->blhd', W_UV, c_t_KV) # (1)
+o   = einsum('bqhl,blhd->bqhd', a, v_t)     # (2)
+u   = einsum('hdD,bhqd->bhD', W_o, o)       # (3)
+
+# 将上述三式合并，得到总的计算过程
+u   = einsum('hdc,blc,bqhl,hdD->bhD', W_UV, c_t_KV, a, W_o)
+
+# 利用结合律改变计算顺序
+o_  = einsum('bhql,blc->bhqc', a, c_t_KV) # (4)
+o   = einsum('bhqc,hdc->bhqd', o_, W_UV)  # (5)
+u   = einsum('hdD,bhqd->bhD', W_o, o)     # (6)
+```
+
+| 实现版本 | 每token每层Cache大小 | 每token每层计算量 |
+| :---: | :---: | :---: |
+| CacheDecompressed (CD) | 81.92 kB | 0.08 MFLOP |
+| CacheCompressed (CC) | 1.152 kB | 33.64 MFLOP |
+| Absorbed_CacheCompressed (A_CC) | 1.152 kB | 0.28 MFLOP |
+
+在A100和4080上的测试结果如下，与理论分析相符。
+
+![](data/absorption-B1.png)
+
+![](data/absorption-B32.png)
 
 ## 后续优化
 

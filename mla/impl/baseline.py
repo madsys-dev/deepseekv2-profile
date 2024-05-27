@@ -117,7 +117,7 @@ class DeepseekAttention(nn.Module):
         self.kv_a_proj_with_mqa = nn.Linear(hidden_size, kv_lora_rank + qk_rope_head_dim, bias=attention_bias, dtype=torch_dtype)
         self.kv_a_layernorm = DeepseekV2RMSNorm(kv_lora_rank).to(torch_dtype)
         self.kv_b_proj = nn.Linear(kv_lora_rank, num_attention_heads * (q_head_dim - qk_rope_head_dim + v_head_dim), bias=False, dtype=torch_dtype)
-        self.o_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, dtype=torch_dtype)
+        self.o_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, bias=attention_bias, dtype=torch_dtype)
         self.rotary_emb = DeepseekV2RotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=max_position_embeddings).to(torch_dtype)
         
     
@@ -153,16 +153,16 @@ class DeepseekAttention(nn.Module):
         q_pe = apply_rotary_pos_emb(q_pe, cos, sin, q_position_ids)
         k_pe = apply_rotary_pos_emb(k_pe, cos, sin, kv_position_ids)
 
-        # query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
-        # query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
-        # query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
+        query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+        query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+        query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
 
-        # key_states = k_pe.new_empty(bsz, self.num_heads, kv_seq_len, self.q_head_dim)
-        # key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
-        # key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
+        key_states = k_pe.new_empty(bsz, self.num_heads, kv_seq_len, self.q_head_dim)
+        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
+        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
 
-        attn_weights = (torch.matmul(q_pe, k_pe.transpose(2, 3)) + torch.matmul(q_nope, k_nope.transpose(2, 3))) * self.softmax_scale
-        # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
+        # attn_weights = (torch.matmul(q_pe, k_pe.transpose(2, 3)) + torch.matmul(q_nope, k_nope.transpose(2, 3))) * self.softmax_scale
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(

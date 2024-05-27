@@ -1,4 +1,3 @@
-from typing import Optional
 import torch
 from torch import nn
 
@@ -17,7 +16,6 @@ class DeepseekV2RMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
-
 
 class DeepseekV2RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
@@ -117,7 +115,7 @@ class DeepseekAttention(nn.Module):
         self.kv_a_proj_with_mqa = nn.Linear(hidden_size, kv_lora_rank + qk_rope_head_dim, bias=attention_bias, dtype=torch_dtype)
         self.kv_a_layernorm = DeepseekV2RMSNorm(kv_lora_rank).to(torch_dtype)
         self.kv_b_proj = nn.Linear(kv_lora_rank, num_attention_heads * (qk_nope_head_dim + v_head_dim), bias=False, dtype=torch_dtype)
-        self.o_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, dtype=torch_dtype)
+        self.o_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, bias=attention_bias, dtype=torch_dtype)
         self.rotary_emb = DeepseekV2RotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=max_position_embeddings).to(torch_dtype)
 
     def compress_kv(self, hidden_states_kv: torch.Tensor, kv_position_ids: torch.LongTensor) -> torch.Tensor:
@@ -161,15 +159,14 @@ class DeepseekAttention(nn.Module):
         
         cos, sin = self.rotary_emb(q_pe)
         q_pe = apply_rotary_pos_emb(q_pe, cos, sin, q_position_ids)
-
+        
         qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         query_states = k_pe.new_empty(bsz, self.num_heads, q_len, qk_head_dim)
-        
         query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
         query_states[:, :, :, self.kv_lora_rank :] = q_pe
 
         key_states = k_pe.new_empty(bsz, self.num_heads, kv_seq_len, qk_head_dim)
-        key_states[:, :, :, : self.kv_lora_rank] = compressed_kv
+        key_states[:, :, :, : self.kv_lora_rank] = compressed_kv.unsqueeze(1)
         key_states[:, :, :, self.kv_lora_rank :] = k_pe
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
@@ -183,9 +180,9 @@ class DeepseekAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(
             attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
-        attn_output = torch.einsum('bhqs,bsD->bhqD', attn_weights, compressed_kv)
-        attn_output = torch.einsum('bhqD,hdD->bhqd', attn_output, out_absorb)
+        ).to(q_nope.dtype)
+        attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv)
+        attn_output = torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(

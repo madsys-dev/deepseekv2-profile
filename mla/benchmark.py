@@ -1,10 +1,7 @@
 from typing import Optional
 from .configuration_deepseek import DeepseekV2Config
-from .impl.baseline import DeepseekAttention as AttentionNoCache
-from .impl.cache_decompressed import DeepseekAttention as AttentionCacheDecompressed
-from .impl.cache_compressed import DeepseekAttention as AttentionCacheCompressed
-from .impl.absorbed import DeepseekAttention as AttentionAbsorbed
-from .impl.absorbed_cache_compressed import DeepseekAttention as AttentionAbsorbedCacheCompressed
+from .impl import *
+import re
 import torch
 import torch.utils.benchmark as benchmark
 
@@ -38,16 +35,21 @@ class BenchmarkFixture:
             sub_label=f'kv_len={self.kv_len}',
         ).blocked_autorange(min_run_time=min_run_time)
     
-    def name(self):
-        return type(self).__name__.removesuffix('Bencher')
+    @classmethod
+    def name(cls):
+        return cls.__name__.removesuffix('Bencher')
+
+    @classmethod
+    def short_name(cls):
+        return re.sub('[^A-Z_]', '', cls.name())
 
     def cache_size(self):
-        return 0    
+        return 0
 
 class BaselineBencher(BenchmarkFixture):
     def __init__(self, config: DeepseekV2Config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
-        self.attn = AttentionNoCache(**self.cfg_dict).cuda()
+        self.attn = AttentionBaseline(**self.cfg_dict).cuda()
         self.kv = self.kv.repeat(self.bsz, 1, 1)
         self.kv_pos = self.kv_pos.repeat(self.bsz, 1)
     
@@ -91,10 +93,22 @@ class AbsorbedBencher(BenchmarkFixture):
     def iter(self):
         return self.attn.forward(self.q, self.kv, self.q_pos, self.kv_pos)
 
-class AbsorbedCacheCompressedBencher(BenchmarkFixture):
+class Absorbed_CacheCompressedBencher(BenchmarkFixture):
     def __init__(self, config: DeepseekV2Config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
-        self.attn = AttentionAbsorbedCacheCompressed(**self.cfg_dict).cuda()
+        self.attn = AttentionAbsorbed_CacheCompressed(**self.cfg_dict).cuda()
+        self.compressed = self.attn.compress_kv(self.kv, self.kv_pos).repeat(self.bsz, 1, 1)
+
+    def iter(self):
+        return self.attn.forward(self.q, self.q_pos, self.compressed)
+    
+    def cache_size(self):
+        return self.compressed.numel() * self.compressed.element_size()
+
+class Absorbed_CacheCompressed_MoveElisionBencher(BenchmarkFixture):
+    def __init__(self, config: DeepseekV2Config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        self.attn = AttentionAbsorbed_CacheCompressed_MoveElision(**self.cfg_dict).cuda()
         self.compressed = self.attn.compress_kv(self.kv, self.kv_pos).repeat(self.bsz, 1, 1)
 
     def iter(self):
@@ -104,19 +118,31 @@ class AbsorbedCacheCompressedBencher(BenchmarkFixture):
         return self.compressed.numel() * self.compressed.element_size()
 
 
-ALL_BENCHMARKS = {
-    'Baseline': BaselineBencher,
-    'CacheDecompressed': CacheDecompressedBencher,
-    'CacheCompressed': CacheCompressedBencher,
-    'Absorbed': AbsorbedBencher,
-    'AbsorbedCacheCompressed': AbsorbedCacheCompressedBencher
-}
+ALL_BENCHMARKS = [
+    BaselineBencher,
+    CacheCompressedBencher,
+    CacheDecompressedBencher,
+    AbsorbedBencher,
+    Absorbed_CacheCompressedBencher,
+    Absorbed_CacheCompressed_MoveElisionBencher,
+]
+
+BENCHERS = {}
+
+doc = 'Run benchmark on various MLA implementations\n\n'
+
+for bencher in ALL_BENCHMARKS:
+    name = bencher.name()
+    short_name = bencher.short_name()
+    BENCHERS[name] = bencher
+    BENCHERS[short_name] = bencher
+    doc += f'{short_name}\t{name}\n'
 
 def main(bench: str,  kv_len: int, bsz: int = 1, config: str = 'mla/config.json', repeat: Optional[int] = None, 
          min_run_time: float = 1.0, csv: bool = False):
     cfg = DeepseekV2Config.from_json_file(config)
     bencher: BenchmarkFixture
-    bencher = ALL_BENCHMARKS[bench](cfg, kv_len, bsz=bsz)
+    bencher = BENCHERS[bench](cfg, kv_len, bsz=bsz)
     if repeat is not None:
         for _ in range(repeat):
             bencher.iter()
@@ -125,13 +151,14 @@ def main(bench: str,  kv_len: int, bsz: int = 1, config: str = 'mla/config.json'
     result = bencher.benchmark(min_run_time=min_run_time)
     cache_size = bencher.cache_size()
     device_name = torch.cuda.get_device_name()
-    del bencher
     if csv:
-        print(f'{bench},{bsz},{kv_len},{device_name},{cache_size},{result.mean},{result.median},{result._p25},{result._p75}')
+        print(f'{bencher.name()},{bsz},{kv_len},{device_name},{cache_size},{result.mean},{result.median},{result._p25},{result._p75}')
     else:
         print(result)
         print(f'Device: {device_name}')
         print(f'KV Cache: {cache_size}')
+
+main.__doc__ = doc
 
 if __name__ == "__main__":
     import fire

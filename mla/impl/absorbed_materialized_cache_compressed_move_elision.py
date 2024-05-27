@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Tuple
 import torch
 from torch import nn
 
@@ -119,7 +119,7 @@ class DeepseekAttention(nn.Module):
         self.kv_b_proj = nn.Linear(kv_lora_rank, num_attention_heads * (qk_nope_head_dim + v_head_dim), bias=False, dtype=torch_dtype)
         self.o_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, bias=attention_bias, dtype=torch_dtype)
         self.rotary_emb = DeepseekV2RotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=max_position_embeddings).to(torch_dtype)
-    
+
     def compress_kv(self, hidden_states_kv: torch.Tensor, kv_position_ids: torch.LongTensor) -> torch.Tensor:
         # return the RoPE'ed & compressed kv
         bsz, kv_seq_len, _ = hidden_states_kv.size()
@@ -132,7 +132,29 @@ class DeepseekAttention(nn.Module):
         cos, sin = self.rotary_emb(k_pe) 
         k_pe = apply_rotary_pos_emb(k_pe, cos, sin, kv_position_ids).view(bsz, kv_seq_len, self.qk_rope_head_dim)
         return torch.cat([compressed_kv, k_pe],dim=-1)
-    
+
+    def get_absorbed_proj(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not hasattr(self, '_absorbed'):
+            assert self.q_b_proj.bias is None and self.kv_b_proj.bias is None and self.o_proj.bias is None
+            q_b_proj = self.q_b_proj.weight.view(self.num_heads, -1, self.q_lora_rank)
+            q_b_proj_nope, q_b_proj_rope = torch.split(q_b_proj, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=1)
+            # [nh, nope_hd, q_lora_rank], [nh, rope_hd, q_lora_rank]
+
+            kv_b_proj = self.kv_b_proj.weight.view(self.num_heads, -1, self.kv_lora_rank)
+            q_absorb, out_absorb = torch.split(kv_b_proj, [self.qk_nope_head_dim, self.v_head_dim], dim=1)
+            # [nh, nope_hd, kv_lora_rank], [nh, v_hd, kv_lora_rank]
+
+            o_proj = self.o_proj.weight.view(self.hidden_size, self.num_heads, self.v_head_dim)
+
+            q_absorbed = torch.einsum('hdq,hdk->hkq', q_b_proj_nope, q_absorb)
+            # q_abosrbed: [num_heads, kv_lora_rank, q_lora_rank]
+            out_absorbed = torch.einsum('hvk,dhv->dhk', out_absorb, o_proj)
+            # out_absorbed: [hidden_size, nh, kv_lora_rank]
+
+            self._absorbed = q_b_proj_rope, q_absorbed, out_absorbed
+        return self._absorbed
+        
+
     def forward(self, hidden_states_q: torch.Tensor, q_position_ids: torch.LongTensor, compressed_kv: torch.Tensor):
         '''
         Attention masks and past cache are removed.
@@ -143,12 +165,12 @@ class DeepseekAttention(nn.Module):
         - position_ids: [bsz, q_len]
         '''
         bsz, q_len, _ = hidden_states_q.size()
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states_q)))
-        q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
-        q_nope, q_pe = torch.split(
-            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
 
+        q_b_proj_rope, q_absorbed, out_absorbed = self.get_absorbed_proj()
+        q = self.q_a_layernorm(self.q_a_proj(hidden_states_q))
+        q_nope = torch.einsum('bqc,hdc->bhqd', q, q_absorbed)
+        q_pe = torch.einsum('bqc,hdc->bhqd', q, q_b_proj_rope)
+        
         cos, sin = self.rotary_emb(q_pe)
         q_pe = apply_rotary_pos_emb(q_pe, cos, sin, q_position_ids)
 
@@ -156,25 +178,10 @@ class DeepseekAttention(nn.Module):
         compressed_kv, k_pe = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
-        k_pe = k_pe.view(bsz, kv_seq_len, 1, self.qk_rope_head_dim).transpose(1, 2)
-        kv = self.kv_b_proj(compressed_kv) \
-            .view(bsz, kv_seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim) \
-            .transpose(1, 2)
+        k_pe = k_pe.view(bsz, 1, kv_seq_len, self.qk_rope_head_dim)
         
-        k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-
-        query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
-        query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
-        query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
-
-        key_states = k_pe.new_empty(bsz, self.num_heads, kv_seq_len, self.q_head_dim)
-        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
-
-        # avoid copying key-states
-        # attn_weights = torch.matmul(q_nope, k_nope.transpose(2, 3)) + torch.matmul(q_pe, k_pe.transpose(2, 3))
-        # attn_weights *= self.softmax_scale
+        attn_weights = torch.matmul(q_pe, k_pe.transpose(2, 3)) + torch.einsum('bhqc,blc->bhql', q_nope, compressed_kv)
+        attn_weights *= self.softmax_scale
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -185,16 +192,7 @@ class DeepseekAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(
             attn_weights, dim=-1, dtype=torch.float32
-        ).to(q_pe.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
-        attn_output = self.o_proj(attn_output)
+        ).to(q_nope.dtype)
+        attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv)
+        attn_output = torch.einsum('bhqc,dhc->bqd', attn_output, out_absorbed)
         return attn_output

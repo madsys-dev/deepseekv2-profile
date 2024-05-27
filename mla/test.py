@@ -1,9 +1,5 @@
 from .configuration_deepseek import DeepseekV2Config
-from .impl.baseline import DeepseekAttention as AttentionBaseline
-from .impl.cache_decompressed import DeepseekAttention as AttentionCacheDecompressed
-from .impl.cache_compressed import DeepseekAttention as AttentionCacheCompressed
-from .impl.absorbed import DeepseekAttention as AttentionAbsorbed
-from .impl.absorbed_cache_compressed import DeepseekAttention as AttentionAbsorbedCacheCompressed
+from .impl import *
 import torch
 from torch import linalg
 import math
@@ -14,7 +10,6 @@ cfg = DeepseekV2Config.from_json_file('mla/config.json')
 
 cfg_dict = cfg.to_dict()
 cfg_dict['torch_dtype'] = cfg.torch_dtype
-
 
 class Fixture:
     config: DeepseekV2Config
@@ -33,7 +28,6 @@ class Fixture:
         self.kv = torch.randn((self.bsz, kv_len, config.hidden_size), dtype=config.torch_dtype, device=dev)
         self.q_pos = torch.randint(0, config.max_position_embeddings-1, (self.bsz, self.q_len), dtype=torch.long, device=dev)
         self.kv_pos = torch.arange(0, self.kv_len, dtype=torch.long, device=dev).unsqueeze(0).repeat(self.bsz, 1)
-
 
 fixture = Fixture(cfg, 1024)
 
@@ -69,9 +63,23 @@ result = absorbed(fixture.q, fixture.kv, fixture.q_pos, fixture.kv_pos)
 l2e, linfe = compute_error(std_result, result)
 print(f'Absorbed: Relative L2 error={l2e}, Relative Linf error={linfe}')
 
-absorbed_cache_compressed = AttentionAbsorbedCacheCompressed(**cfg_dict).cuda()
+absorbed_cache_compressed = AttentionAbsorbed_CacheCompressed(**cfg_dict).cuda()
 absorbed_cache_compressed.load_state_dict(state_dict)
 compressed = absorbed_cache_compressed.compress_kv(fixture.kv, fixture.kv_pos)
 result = absorbed_cache_compressed(fixture.q, fixture.q_pos, compressed)
 l2e, linfe = compute_error(std_result, result)
-print(f'AbsorbedCacheCompressed: Relative L2 error={l2e}, Relative Linf error={linfe}')
+print(f'Absorbed_CacheCompressed: Relative L2 error={l2e}, Relative Linf error={linfe}')
+
+absorbed_cache_compressed_move_elision = AttentionAbsorbed_CacheCompressed_MoveElision(**cfg_dict).cuda()
+absorbed_cache_compressed_move_elision.load_state_dict(state_dict)
+compressed = absorbed_cache_compressed_move_elision.compress_kv(fixture.kv, fixture.kv_pos)
+result = absorbed_cache_compressed_move_elision(fixture.q, fixture.q_pos, compressed)
+l2e, linfe = compute_error(std_result, result)
+print(f'Absorbed_CacheCompressed_MoveElision: Relative L2 error={l2e}, Relative Linf error={linfe}')
+
+absorbed_materialized_cache_compressed_move_elision = AttentionAbsorbedMaterialized_CacheCompressed_MoveElision(**cfg_dict).cuda()
+absorbed_materialized_cache_compressed_move_elision.load_state_dict(state_dict)
+compressed = absorbed_materialized_cache_compressed_move_elision.compress_kv(fixture.kv, fixture.kv_pos)
+result = absorbed_materialized_cache_compressed_move_elision(fixture.q, fixture.q_pos, compressed)
+l2e, linfe = compute_error(std_result, result)
+print(f'AbsorbedMaterialized_CacheCompressed_MoveElision: Relative L2 error={l2e}, Relative Linf error={linfe}')

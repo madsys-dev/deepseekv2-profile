@@ -117,7 +117,7 @@ class DeepseekAttention(nn.Module):
         self.kv_a_proj_with_mqa = nn.Linear(hidden_size, kv_lora_rank + qk_rope_head_dim, bias=attention_bias, dtype=torch_dtype)
         self.kv_a_layernorm = DeepseekV2RMSNorm(kv_lora_rank).to(torch_dtype)
         self.kv_b_proj = nn.Linear(kv_lora_rank, num_attention_heads * (qk_nope_head_dim + v_head_dim), bias=False, dtype=torch_dtype)
-        self.o_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, dtype=torch_dtype)
+        self.o_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, bias=attention_bias, dtype=torch_dtype)
         self.rotary_emb = DeepseekV2RotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=max_position_embeddings).to(torch_dtype)
 
     def forward(self, hidden_states_q: torch.Tensor, hidden_states_kv: torch.Tensor, q_position_ids: torch.LongTensor, 
@@ -161,7 +161,7 @@ class DeepseekAttention(nn.Module):
         query_states[:, :, :, self.kv_lora_rank :] = q_pe
 
         key_states = k_pe.new_empty(bsz, self.num_heads, kv_seq_len, qk_head_dim)
-        key_states[:, :, :, : self.kv_lora_rank] = compressed_kv
+        key_states[:, :, :, : self.kv_lora_rank] = compressed_kv.unsqueeze(1)
         key_states[:, :, :, self.kv_lora_rank :] = k_pe
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
