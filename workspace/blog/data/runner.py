@@ -6,6 +6,8 @@ from typing import List
 
 def main(start: int = 32, end : int = 128 * 1024, bsz: int = 1, 
          bench: List[str] = ['Baseline', 'CacheDecompressed', 'CacheCompressed']):
+    if isinstance(bench, str):
+        bench = [bench]
     sys.stdout.write('bench,bsz,kv_len,device_name,cache_size,mean,median,p25,p75\n')
     sys.stdout.flush()
     for method in bench:

@@ -8,6 +8,8 @@ MLA机制是DeepSeek-V2中的一个核心创新点。作为计算机系统方向
 
 DeepSeek-V2开源的代码中未对MLA算子进行过多的优化。我们尝试复现了一些MLA算子在推理阶段（具体来说，是推理阶段中的decoding阶段）可能涉及的优化点，并对其进行了评测和分析。
 
+本文中所涉及的全部代码的地址：https://github.com/madsys-dev/deepseekv2-profile 
+
 ## MLA算子的计算过程
 
 给定输入向量$h_t \in \mathbb{R}^{B \times L \times 5120}$，其中$B$为batch size，$L$为sequence length，MLA的计算过程如下。
@@ -52,7 +54,7 @@ $$ a = \mathrm{softmax}\left(\frac{q_t^\top k_t + \mathrm{Mask}}{\sqrt{192}}\rig
 计算对V的加权和，并将所有head压平，得到Attention输出：
 $$ o = a \cdot v_t \in \mathbb{R}^{B \times L \times H \times 128} \cong \mathbb{R}^{B \times L \times 16384} $$
 经过另一个矩阵的投影，就能得到MLA的最终输出：
-$$ u = W^o o \in \mathbb{R}^{B \times L \times 5120} $$
+$$ u = W^O o \in \mathbb{R}^{B \times L \times 5120} $$
 
 ## 开源代码MLA算子分析
 
@@ -117,7 +119,7 @@ def forward(...):
 
 然而，在以MHA为代表的传统Attention算子中，这种空间换时间的策略往往会矫枉过正。由于KV cache占用的空间很大，并且KV cache中的数据在每次迭代过程中仅参与一次计算，在使用KV cache后，虽然计算量减小了，但是显存占用量以及显存带宽需求却急剧上升，成为了制约大模型推理效率的新瓶颈。MLA的设计通过多头共用压缩后的KV表示，一方面大幅减少了KV cache的占用，另一方面，由于Compressed KV在每个head中都参与了计算，DeepSeek-V2的128个heads能够提供足够的计算强度，因此Attention部分的MFU也得到了大幅提高。
 
-在开源的版本中， MLA算子了完整的KV Cache，丧失了MLA的上述种种好处。我们尝试改为缓存压缩后的KV Cache，并与缓存完整的KV Cache进行对比。
+在开源的版本中， MLA算子了完整的KV Cache，丧失了MLA的上述种种好处。我们尝试改为缓存压缩后的KV Cache，并与缓存完整的KV Cache进行对比。当然，此处我们也将RoPE后的k_pe一并缓存入KV Cache中。
 
 ``` python
 # CacheCompressed
@@ -136,11 +138,10 @@ def forward(self, hidden_states_q: torch.Tensor, q_position_ids: torch.LongTenso
     ... 
 ```
 
-另外，我们还实现了一个不缓存任何KV Cache的版本作为Baseline。各种实现的KV Cache占用和计算量如下表：
+两种实现的KV Cache占用和计算量如下表：
 
 | 实现版本 | 每token每层Cache大小 | 每token每层计算量 |
 | :---: | :---: | :---: |
-| Baseline | 0 | 39.53 MFLOP |
 | CacheDecompressed (CD) | 81.92 kB | 0.08 MFLOP |
 | CacheCompressed (CC) | 1.152 kB | 33.64 MFLOP |
 
@@ -150,7 +151,7 @@ def forward(self, hidden_states_q: torch.Tensor, q_position_ids: torch.LongTenso
 
 ![](data/caching-B1.png)
 
-此时，CacheDecompressed的性能最好，CacheCompressed次之，Baseline最差。这正好与三种实现的计算量相对应。
+CacheDecompressed的性能明显好于CacheCompressed。这说明，CacheCompressed策略还需进一步优化，降低per token的计算量，才能取得较好的性能。
 
 当Batch Size=32时，各实现的性能如下图所示：
 
@@ -169,7 +170,7 @@ $$
 $$
 即通过矩阵乘法结合律，可以改为计算$({c_t^Q}^{\top}{W^{UQ}}^{\top} W^{UK})$，避免了解压缩出完整的K矩阵。此外，在原始版本的解压缩的过程中，由于每个token的key都需要与$W^{UK}$相乘才能得到，因此计算量较大；矩阵吸收后，$W^{UK}$只需要对$q_t^C$这一个向量相乘，也大大减少了浮点计算量。
 
-对于V的吸收，情况稍微复杂。为表述的清楚性，我们采用Einsten求和约定描述该过程：
+对于V的吸收，情况稍微复杂。为表述的清楚性，我们采用Einstein求和约定描述该过程：
 ``` python
 v_t = einsum('hdc,blc->blhd', W_UV, c_t_KV) # (1)
 o   = einsum('bqhl,blhd->bqhd', a, v_t)     # (2)
@@ -184,18 +185,112 @@ o   = einsum('bhqc,hdc->bhqd', o_, W_UV)  # (5)
 u   = einsum('hdD,bhqd->bhD', W_o, o)     # (6)
 ```
 
+具体的代码实现如下：
+``` python
+# Absorbed_CacheCompressed
+def forward(hidden_states_q: torch.Tensor, q_position_ids: torch.LongTensor, compressed_kv: torch.Tensor):
+    ...
+    kv_b_proj = self.kv_b_proj.weight.view(self.num_heads, -1, self.kv_lora_rank)
+    q_absorb = kv_b_proj[:, :self.qk_nope_head_dim,:]
+    out_absorb = kv_b_proj[:, self.qk_nope_head_dim:, :]
+    
+    cos, sin = self.rotary_emb(q_pe)
+    q_pe = apply_rotary_pos_emb(q_pe, cos, sin, q_position_ids)
+    
+    qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+    query_states = k_pe.new_empty(bsz, self.num_heads, q_len, qk_head_dim)
+    # 此处改变了q_nope的计算顺序
+    query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+    query_states[:, :, :, self.kv_lora_rank :] = q_pe
+    
+    ...
+
+    attn_weights = nn.functional.softmax(
+        attn_weights, dim=-1, dtype=torch.float32
+    ).to(q_nope.dtype)
+    # 此处改变了attn_output的计算顺序
+    attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv)
+    attn_output = torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
+
+    if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
+            f" {attn_output.size()}"
+        )
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+    attn_output = self.o_proj(attn_output)
+```
+
+#### Move Elision
+不过，这样还不能完全发挥出MLA的威力。在原始代码中，query_states和key_states会通过拼接RoPE和非RoPE部分得到：
+``` python
+def forward(...):
+    ...
+    query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+    query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+    query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
+
+    key_states = k_pe.new_empty(bsz, self.num_heads, kv_seq_len, self.q_head_dim)
+    key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
+    key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
+    ...
+```
+当我们采取了上述优化后，此处的拼接过程会产生大量无用的数据拷贝和广播，同时也会占用大量显存空间。为此，我们采用MoveElision优化策略，
+即省略此处的拼接RoPE部分和非RoPE部分的过程，而是直接分别计算量部分的额Attention Score并相加（考虑$q_t^\top k_t = {q_t^C}^\top k_t^C + {q_t^R}^\top k_t^R$）：
+``` python
+# Absorbed_CacheCompressed_MoveElision
+def forward(...):
+    ...
+    # qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+    # query_states = k_pe.new_empty(bsz, self.num_heads, q_len, qk_head_dim)
+    # query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+    # query_states[:, :, :, self.kv_lora_rank :] = q_pe
+
+    # key_states = k_pe.new_empty(bsz, self.num_heads, kv_seq_len, qk_head_dim)
+    # key_states[:, :, :, : self.kv_lora_rank] = compressed_kv.unsqueeze(1)
+    # key_states[:, :, :, self.kv_lora_rank :] = k_pe
+
+    # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
+
+    attn_weights = torch.matmul(q_pe, k_pe.transpose(2, 3)) + torch.einsum('bhqc,blc->bhql', q_nope, compressed_kv)
+    attn_weights *= self.softmax_scale
+    ...
+```
+
+这样，我们得到了以下四个版本的优化实现：
+
 | 实现版本 | 每token每层Cache大小 | 每token每层计算量 |
 | :---: | :---: | :---: |
 | CacheDecompressed (CD) | 81.92 kB | 0.08 MFLOP |
 | CacheCompressed (CC) | 1.152 kB | 33.64 MFLOP |
 | Absorbed_CacheCompressed (A_CC) | 1.152 kB | 0.28 MFLOP |
+| Absorbed_CacheCompressed_MoveElision (A_CC_ME) | 1.152 kB | 0.28 MFLOP |
 
-在A100和4080上的测试结果如下，与理论分析相符。
+在A100-PCIe-40G和GeForce RTX 4080上的测试结果如下，与理论分析完全相符。
 
 ![](data/absorption-B1.png)
 
 ![](data/absorption-B32.png)
 
+值得注意的是，当采用MoveElision策略后，由于显存占用的减少，可以处理的batch size和sequence length得以明显增加，充分体现出了MLA的压缩表示的优势。
+
+#### Materializing Projection Matrices?
+
+DeepSeek-V2的论文中说：
+> ..., we can absorb $W^{UK}$ into $W^{UQ}$, and $W^{UV}$ into $W^O$.
+
+不过，我们似乎并没有必要再改变顺序，对模型参数进行预处理，将$W^{UK}$与$W^{UQ}$相乘，以及将$W^{UV}$与$W^O$相乘。这是因为，$W^{UK}$与$W^{UQ}$相乘后的结果可以视为$H$个大小为$1536 \times 512$的低秩（不超过128）矩阵，而$W^{UV}$与$W^O$相乘的结果可以视为$H$个大小为$5120 \times 512$的低秩矩阵。相比用这些特别大的低秩矩阵做投影，明显不如按照低秩分解形式依次相乘来得划算。因此，我们认为这一步的优化并不是很有必要。
+
+我们实现了这一优化版本（AM_CC_ME），并进行了测试。测试结果能够印证我们的观点。
+
+![](data/am-B1.png)
+
+![](data/am-B32.png)
+
+该优化后的性能明显不如原来的版本，尤其是当sequence length较小，这些投影的计算时间占主导时，性能差距尤甚。
+
 ## 后续优化
 
-
+目前的代码实现是基于矩阵乘法实现的，因此在计算过程中会需要完整的算出来 attention score 矩阵。如需进一步优化，可以考虑类似FlashAttention的做法，即一次性读入整个KV-pair进行计算。由于MLA的K和V是共享同一个压缩表示（实际上，上述优化过的MLA算子可以视为满足K=V的一种特殊的MQA），这样可以进一步减少显存读取，提高计算强度。

@@ -150,7 +150,6 @@ class DeepseekAttention(nn.Module):
             # q_abosrbed: [num_heads, kv_lora_rank, q_lora_rank]
             out_absorbed = torch.einsum('hvk,dhv->dhk', out_absorb, o_proj)
             # out_absorbed: [hidden_size, nh, kv_lora_rank]
-
             self._absorbed = q_b_proj_rope, q_absorbed, out_absorbed
         return self._absorbed
         

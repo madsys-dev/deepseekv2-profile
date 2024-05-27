@@ -117,6 +117,18 @@ class Absorbed_CacheCompressed_MoveElisionBencher(BenchmarkFixture):
     def cache_size(self):
         return self.compressed.numel() * self.compressed.element_size()
 
+class AbsorbedMaterialized_CacheCompressed_MoveElisionBencher(BenchmarkFixture):
+    def __init__(self, config: DeepseekV2Config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        self.attn = AttentionAbsorbedMaterialized_CacheCompressed_MoveElision(**self.cfg_dict).cuda()
+        self.compressed = self.attn.compress_kv(self.kv, self.kv_pos).repeat(self.bsz, 1, 1)
+
+    def iter(self):
+        return self.attn.forward(self.q, self.q_pos, self.compressed)
+    
+    def cache_size(self):
+        return self.compressed.numel() * self.compressed.element_size()
+
 
 ALL_BENCHMARKS = [
     BaselineBencher,
@@ -125,6 +137,7 @@ ALL_BENCHMARKS = [
     AbsorbedBencher,
     Absorbed_CacheCompressedBencher,
     Absorbed_CacheCompressed_MoveElisionBencher,
+    AbsorbedMaterialized_CacheCompressed_MoveElisionBencher,
 ]
 
 BENCHERS = {}
