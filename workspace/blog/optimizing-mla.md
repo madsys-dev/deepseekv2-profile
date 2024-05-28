@@ -1,4 +1,4 @@
-# DeepSeek-V2高性能推理优化笔记：MLA算子优化
+# DeepSeek-V2高性能推理优化笔记：MLA优化
 
 ## 前言
 
@@ -10,7 +10,7 @@ DeepSeek-V2开源的代码中未对MLA算子进行过多的优化。我们尝试
 
 本文中所涉及的全部代码的地址：https://github.com/madsys-dev/deepseekv2-profile 
 
-## MLA算子的计算过程
+## MLA模块的计算过程
 
 给定输入向量$h_t \in \mathbb{R}^{B \times L \times 5120}$，其中$B$为batch size，$L$为sequence length，MLA的计算过程如下。
 
@@ -56,7 +56,7 @@ $$ o = a \cdot v_t \in \mathbb{R}^{B \times L \times H \times 128} \cong \mathbb
 经过另一个矩阵的投影，就能得到MLA的最终输出：
 $$ u = W^O o \in \mathbb{R}^{B \times L \times 5120} $$
 
-## 开源代码MLA算子分析
+## 开源代码MLA分析
 
 ``` python
 def forward(...):
@@ -111,11 +111,11 @@ def forward(...):
     ...
 ```
 
-## MLA实现优化
+## MLA模块的实现优化
 
 ### KV Caching
 
-在原始的transformer计算过程中，每次都需要计算完整的KV向量，这部分的计算往往会带来较大的开销。实际上，每次模型迭代过程中，这些KV向量的值都是一样的。因此，我们可以采用“空间换时间”的策略，将先前迭代过程中KV向量的值缓存下来，这样在后续的迭代过程中，就不需要重复计算KV向量了，从而大大减小了模型推理过程中的计算量。
+在原始的transformer模型的decoding过程中，每次迭代都需要计算所有token对应的的KV向量，这部分的计算往往会带来较大的开销。实际上，每次迭代过程中，这些KV向量的值都是一样的；因此，我们可以采用“空间换时间”的策略，将先前迭代过程中KV向量的值缓存下来，这样在后续的迭代过程中，就不需要重复计算KV向量了，从而大大减小了模型推理过程中的计算量。
 
 然而，在以MHA为代表的传统Attention算子中，这种空间换时间的策略往往会矫枉过正。由于KV cache占用的空间很大，并且KV cache中的数据在每次迭代过程中仅参与一次计算，在使用KV cache后，虽然计算量减小了，但是显存占用量以及显存带宽需求却急剧上升，成为了制约大模型推理效率的新瓶颈。MLA的设计通过多头共用压缩后的KV表示，一方面大幅减少了KV cache的占用，另一方面，由于Compressed KV在每个head中都参与了计算，DeepSeek-V2的128个heads能够提供足够的计算强度，因此Attention部分的MFU也得到了大幅提高。
 
@@ -145,7 +145,7 @@ def forward(self, hidden_states_q: torch.Tensor, q_position_ids: torch.LongTenso
 | CacheDecompressed (CD) | 81.92 kB | 0.08 MFLOP |
 | CacheCompressed (CC) | 1.152 kB | 33.64 MFLOP |
 
-可以看到，CacheDecompressed策略虽然可以节省几乎全部的浮点计算量，但其显存占用量却达到了81.92kB每token。这使得CacheDecompressed的瓶颈很容易卡在显存容量和显存带宽上。而CacheCompressed的策略虽然相比Baseline只能节省大约15%的浮点计算量，但是显存占用却少了约98.6%。因此，我们可以期望CacheCompressed策略能够更加均衡的利用GPU的各项硬件能力，并且提供更大的batch size，从而降低推理成本。
+可以看到，CacheDecompressed策略虽然可以节省几乎全部的浮点计算量，但其显存占用量却达到了81.92kB每token。这使得CacheDecompressed的瓶颈很容易卡在显存容量和显存带宽上。而CacheCompressed的显存占用却少了约98.6%。因此，我们可以期望CacheCompressed策略能够更加均衡的利用GPU的各项硬件能力，并且提供更大的batch size，从而降低推理成本。
 
 我们分别在A100-PCIe-40G（Compute80架构）和GeForce RTX 4080（Compute89架构）上对上述实现进行性能测试。对于单个request，各种实现的性能表现如下图所示：
 
@@ -237,7 +237,7 @@ def forward(...):
     key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
     ...
 ```
-当我们采取了上述优化后，此处的拼接过程会产生大量无用的数据拷贝和广播，同时也会占用大量显存空间。为此，我们采用MoveElision优化策略，
+当我们采取了上述优化后，此处的拼接过程会产生大量无用的数据拷贝和广播，同时也会占用大量显存空间导致OOM。为此，我们采用MoveElision优化策略，
 即省略此处的拼接RoPE部分和非RoPE部分的过程，而是直接分别计算量部分的额Attention Score并相加（考虑$q_t^\top k_t = {q_t^C}^\top k_t^C + {q_t^R}^\top k_t^R$）：
 ``` python
 # Absorbed_CacheCompressed_MoveElision
@@ -270,9 +270,9 @@ def forward(...):
 
 在A100-PCIe-40G和GeForce RTX 4080上的测试结果如下，与理论分析完全相符。
 
-![](data/absorption-B1.png)
+![](data/absorption-B1-annotated.png)
 
-![](data/absorption-B32.png)
+![](data/absorption-B32-annotated.png)
 
 值得注意的是，当采用MoveElision策略后，由于显存占用的减少，可以处理的batch size和sequence length得以明显增加，充分体现出了MLA的压缩表示的优势。
 
@@ -285,12 +285,12 @@ DeepSeek-V2的论文中说：
 
 我们实现了这一优化版本（AM_CC_ME），并进行了测试。测试结果能够印证我们的观点。
 
-![](data/am-B1.png)
+![](data/am-B1-annotated.png)
 
-![](data/am-B32.png)
+![](data/am-B32-annotated.png)
 
 该优化后的性能明显不如原来的版本，尤其是当sequence length较小，这些投影的计算时间占主导时，性能差距尤甚。
 
 ## 后续优化
 
-目前的代码实现是基于矩阵乘法实现的，因此在计算过程中会需要完整的算出来 attention score 矩阵。如需进一步优化，可以考虑类似FlashAttention的做法，即一次性读入整个KV-pair进行计算。由于MLA的K和V是共享同一个压缩表示（实际上，上述优化过的MLA算子可以视为满足K=V的一种特殊的MQA），这样可以进一步减少显存读取，提高计算强度。
+目前的代码实现是基于矩阵乘法实现的，因此在计算过程中会需要完整的算出来 attention score 矩阵。如需进一步优化，可以考虑类似FlashAttention的做法，即一次性读入整个KV-pair进行计算。由于MLA的K和V是共享同一个压缩表示（实际上，上述优化过的MLA实现非常类似于满足$K=V$的MQA），这样可以进一步减少显存读取，提高计算强度。
