@@ -161,21 +161,8 @@ class DeepseekAttention(nn.Module):
         cos, sin = self.rotary_emb(q_pe)
         q_pe = apply_rotary_pos_emb(q_pe, cos, sin, q_position_ids)
 
-        
-        q_nope = torch.einsum('hdc,bhqd->bhqc', q_absorb, q_nope) 
-        
-        # qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-        # query_states = k_pe.new_empty(bsz, self.num_heads, q_len, qk_head_dim)
-        # query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
-        # query_states[:, :, :, self.kv_lora_rank :] = q_pe
-
-        # key_states = k_pe.new_empty(bsz, self.num_heads, kv_seq_len, qk_head_dim)
-        # key_states[:, :, :, : self.kv_lora_rank] = compressed_kv.unsqueeze(1)
-        # key_states[:, :, :, self.kv_lora_rank :] = k_pe
-
-        attn_weights = torch.matmul(q_pe, k_pe.transpose(2, 3)) + torch.einsum('bhqc,blc->bhql', q_nope, compressed_kv)
-        attn_weights *= self.softmax_scale
-
+        q_nope = torch.matmul(q_nope, q_absorb) 
+        attn_weights = (torch.matmul(q_pe, k_pe.mT) + torch.matmul(q_nope, compressed_kv.unsqueeze(-3).mT)) * self.softmax_scale
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
@@ -187,7 +174,7 @@ class DeepseekAttention(nn.Module):
             attn_weights, dim=-1, dtype=torch.float32
         ).to(q_nope.dtype)
         attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv)
-        attn_output = torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
+        attn_output = torch.matmul(attn_output, out_absorb.mT) # torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(

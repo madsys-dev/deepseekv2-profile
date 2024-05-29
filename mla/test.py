@@ -20,7 +20,7 @@ class Fixture:
 
     def __init__(self, config: DeepseekV2Config, kv_len: int):
         self.config = config
-        self.bsz = 1
+        self.bsz = 16
         self.q_len = 1
         self.kv_len = kv_len
         dev = 'cuda'

@@ -179,8 +179,7 @@ class DeepseekAttention(nn.Module):
         )
         k_pe = k_pe.view(bsz, 1, kv_seq_len, self.qk_rope_head_dim)
         
-        attn_weights = torch.matmul(q_pe, k_pe.transpose(2, 3)) + torch.einsum('bhqc,blc->bhql', q_nope, compressed_kv)
-        attn_weights *= self.softmax_scale
+        attn_weights = (torch.matmul(q_pe, k_pe.mT) + torch.matmul(q_nope, compressed_kv.unsqueeze(-3).mT)) * self.softmax_scale
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(

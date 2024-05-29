@@ -825,7 +825,7 @@ class DeepseekV2Attention(nn.Module):
         compressed_kv = self.kv_a_layernorm(compressed_kv)
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
 
-        kv_seq_len = k_pe.shape[2]
+        kv_seq_len = k_pe.shape[-2]
         if past_key_value is not None:
             if self.layer_idx is None:
                 raise ValueError(
@@ -850,10 +850,8 @@ class DeepseekV2Attention(nn.Module):
         q_absorb = kv_b_proj[:, :self.qk_nope_head_dim,:]
         out_absorb = kv_b_proj[:, self.qk_nope_head_dim:, :]
 
-        q_nope = torch.einsum('hdc,bhqd->bhqc', q_absorb, q_nope)
-        attn_weights = torch.matmul(q_pe, k_pe.transpose(2, 3)) + torch.einsum('bhqc,blc->bhql', q_nope, compressed_kv)
-        attn_weights *= self.softmax_scale
-
+        q_nope = torch.matmul(q_nope, q_absorb)
+        attn_weights = (torch.matmul(q_pe, k_pe.mT) + torch.matmul(q_nope, compressed_kv.unsqueeze(-3).mT)) * self.softmax_scale
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
@@ -875,7 +873,8 @@ class DeepseekV2Attention(nn.Module):
             attn_weights, p=self.attention_dropout, training=self.training
         )
         attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv)
-        attn_output = torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
+
+        attn_output = torch.matmul(attn_output, out_absorb.mT) 
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(
