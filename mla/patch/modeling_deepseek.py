@@ -841,9 +841,7 @@ class DeepseekV2Attention(nn.Module):
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             compressed_kv = compressed_kv.unsqueeze(1)
-            compressed_kv, k_pe = past_key_value.update(
-                compressed_kv, k_pe, self.layer_idx, cache_kwargs
-            )
+            k_pe, compressed_kv = past_key_value.update(k_pe, compressed_kv, self.layer_idx, cache_kwargs)
             compressed_kv = compressed_kv.squeeze(1)
         
         kv_b_proj = self.kv_b_proj.weight.view(self.num_heads, -1, self.kv_lora_rank)
