@@ -147,8 +147,8 @@ class DeepseekAttention(nn.Module):
 
     def split_kv_b_proj(self):
         kv_b_proj_weight = self.kv_b_proj.weight.view(self.num_heads, -1, self.kv_lora_rank)
-        self.q_absorb = kv_b_proj_weight[:, :self.qk_nope_head_dim,:]
-        self.out_absorb = kv_b_proj_weight[:, self.qk_nope_head_dim:, :]
+        self.q_absorb = kv_b_proj_weight[:, :self.qk_nope_head_dim,:].unsqueeze(0).transpose(0, 1)
+        self.out_absorb = kv_b_proj_weight[:, self.qk_nope_head_dim:, :].unsqueeze(0)
         del self.kv_b_proj
 
     def compress_kv(self, hidden_states_kv: torch.Tensor, kv_position_ids: torch.LongTensor) -> torch.Tensor:
@@ -187,7 +187,7 @@ class DeepseekAttention(nn.Module):
         cos, sin = self.rotary_emb.cos_cached, self.rotary_emb.sin_cached
         q_pe = apply_rotary_pos_emb(q_pe, cos, sin, q_position_ids)
 
-        q_nope = torch.matmul(q_nope, self.q_absorb) 
+        q_nope = torch.matmul(q_nope.transpose(0, 1), self.q_absorb).transpose(0, 1)
         attn_weights = (torch.matmul(q_pe, k_pe.mT) + torch.matmul(q_nope, compressed_kv.unsqueeze(-3).mT)) * self.softmax_scale
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -200,7 +200,7 @@ class DeepseekAttention(nn.Module):
             attn_weights, dim=-1, dtype=torch.float32
         ).to(q_nope.dtype)
         attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv)
-        attn_output = torch.matmul(attn_output, self.out_absorb.mT) # torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
+        attn_output = torch.matmul(attn_output.permute(2, 1, 0, 3), self.out_absorb.mT).permute(2, 1, 0, 3) # torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(
