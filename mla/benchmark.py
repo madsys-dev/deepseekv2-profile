@@ -1,6 +1,6 @@
 from typing import Optional
-from .configuration_deepseek import DeepseekV2Config
-from .impl import *
+from configuration_deepseek import DeepseekV2Config
+from impl import *
 import re
 import torch
 import torch.utils.benchmark as benchmark
@@ -164,12 +164,19 @@ def main(bench: str,  kv_len: int, bsz: int = 1, config: str = 'mla/config.json'
     result = bencher.benchmark(min_run_time=min_run_time)
     cache_size = bencher.cache_size()
     device_name = torch.cuda.get_device_name()
-    if csv:
-        print(f'{bencher.name()},{bsz},{kv_len},{device_name},{cache_size},{result.mean},{result.median},{result._p25},{result._p75}')
-    else:
-        print(result)
-        print(f'Device: {device_name}')
-        print(f'KV Cache: {cache_size}')
+    
+    # Return the results as a dictionary instead of printing
+    return {
+        'Model': bencher.name(),
+        'Batch_Size': bsz,
+        'KV_Length': kv_len,
+        'Device': device_name,
+        'Cache_Size': cache_size,
+        'Mean': result.mean,
+        'Median': result.median,
+        'P25': result._p25,
+        'P75': result._p75
+    }
 
 main.__doc__ = doc
 

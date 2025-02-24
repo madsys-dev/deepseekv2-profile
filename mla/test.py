@@ -1,5 +1,5 @@
-from .configuration_deepseek import DeepseekV2Config
-from .impl import *
+from configuration_deepseek import DeepseekV2Config
+from impl import *
 import torch
 from torch import linalg
 import math

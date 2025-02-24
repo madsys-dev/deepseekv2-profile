@@ -1,0 +1,19 @@
+{
+    "name": "PyTorch GPU Development",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": "."
+    },
+    "runArgs": [
+        "--gpus=all"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.debugpy"
+            ]
+        }
+    },
+    "remoteUser": "root"
+}
