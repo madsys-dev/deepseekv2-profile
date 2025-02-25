@@ -6,7 +6,13 @@ import numpy as np
 import pandas as pd
 import torch
 # Set random seeds for reproducibility
-seed = 100
+# Set GPU device if available
+if torch.cuda.is_available():
+    torch.cuda.set_device(5)  # Select GPU 5 (sixth GPU)
+    print(f"Using GPU: {torch.cuda.current_device()}")
+
+
+seed = 50
 np.random.seed(seed)
 torch.manual_seed(seed)
 if torch.cuda.is_available():
@@ -14,13 +20,11 @@ if torch.cuda.is_available():
 
 def run_benchmarks():
     # Sequence lengths to test (100, 316, 1000, 3162, 10000)
-    kv_lengths = [int(x) for x in np.logspace(2, 5, num=12)]
-    batch_size = 64
+    kv_lengths = [int(x) for x in np.logspace(2, 6, num=3)]
+    batch_size = 32
     
     # Models to benchmark
-    models = ['CacheCompressed', 'CacheDecompressed', 'Absorbed_CacheCompressed', 
-    'Absorbed_CacheCompressed_MoveElision', 'AbsorbedMaterialized_CacheCompressed_MoveElision']
-    
+    models = ['SimpleAttention', 'SimpleCompressedAttention'] #'OptimizedMLA']
     # Create results directory if it doesn't exist
     base_results_dir = "results"
     results_dir = os.path.join(base_results_dir, f"bsz-{batch_size}")
@@ -37,11 +41,11 @@ def run_benchmarks():
             cmd = [
                 'python3',
                 'mla/benchmark.py',
-                model,
-                str(length),
+                '--bench', model,
+                '--kv_len', str(length),
                 f'--bsz={batch_size}',
                 '--config=mla/config.json',
-                '--min_run_time=1.0'
+                '--min_run_time=2.0'
             ]
             
             # Run the benchmark and get the results
