@@ -155,13 +155,13 @@ class DeepseekAttention(nn.Module):
         k_pe = k_pe.view(bsz, 1, kv_seq_len, self.qk_rope_head_dim)
         
         kv_b_proj = self.kv_b_proj.weight.view(self.num_heads, -1, self.kv_lora_rank)
-        q_absorb = kv_b_proj[:, :self.qk_nope_head_dim,:]
-        out_absorb = kv_b_proj[:, self.qk_nope_head_dim:, :]
+        q_absorb = kv_b_proj[:, :self.qk_nope_head_dim,:].unsqueeze(0)
+        out_absorb = kv_b_proj[:, self.qk_nope_head_dim:, :].unsqueeze(0)
         
         cos, sin = self.rotary_emb(q_pe)
         q_pe = apply_rotary_pos_emb(q_pe, cos, sin, q_position_ids)
 
-        q_nope = torch.matmul(q_nope, q_absorb) 
+        q_nope = torch.matmul(q_nope.transpose(0, 2), q_absorb).transpose(0, 2)
         attn_weights = (torch.matmul(q_pe, k_pe.mT) + torch.matmul(q_nope, compressed_kv.unsqueeze(-3).mT)) * self.softmax_scale
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -174,7 +174,7 @@ class DeepseekAttention(nn.Module):
             attn_weights, dim=-1, dtype=torch.float32
         ).to(q_nope.dtype)
         attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv)
-        attn_output = torch.matmul(attn_output, out_absorb.mT) # torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
+        attn_output = attn_output = torch.matmul(attn_output.permute(2, 1, 0, 3), out_absorb.mT).permute(2, 1, 0, 3) # torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(
