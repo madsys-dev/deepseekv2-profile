@@ -182,7 +182,7 @@ u   = einsum('hdc,blc,bqhl,hdD->bhD', W_UV, c_t_KV, a, W_o)
 # 利用结合律改变计算顺序
 o_  = einsum('bhql,blc->bhqc', a, c_t_KV) # (4)
 o   = einsum('bhqc,hdc->bhqd', o_, W_UV)  # (5)
-u   = einsum('hdD,bhqd->bhD', W_o, o)     # (6)
+u   = einsum('hdD,bhqd->bqD', W_o, o)     # (6)
 ```
 
 具体的代码实现如下：
