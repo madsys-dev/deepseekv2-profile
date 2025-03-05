@@ -5,25 +5,20 @@ import re
 import torch
 import torch.utils.benchmark as benchmark
 import math
+from models import SimpleAttention, SimpleCompressedAttention, SimpleAbsorbedAttention
+
 
 torch.set_grad_enabled(False)
 
+
 class BenchmarkFixture:
     config: DeepseekV2Config
-    q: torch.Tensor
-    kv: torch.Tensor
-    q_pos: torch.LongTensor
-    kv_pos: torch.LongTensor
 
     def __init__(self, config: DeepseekV2Config, kv_len: int, q_len: int = 1, bsz: int = 1, dev='cuda'):
         self.config = config
         self.bsz = bsz
-        self.q_len = q_len
         self.kv_len = kv_len
-        self.q = torch.randn((self.bsz, self.q_len, config.hidden_size), dtype=config.torch_dtype, device=dev)
-        self.kv = torch.randn((1, kv_len, config.hidden_size), dtype=config.torch_dtype, device=dev)
-        self.q_pos = torch.randint(0, config.max_position_embeddings-1, (self.bsz, self.q_len), dtype=torch.long, device=dev)
-        self.kv_pos = torch.arange(0, self.kv_len, dtype=torch.long, device=dev).unsqueeze(0)
+        self.dev = dev
         cfg_dict = config.to_dict()
         cfg_dict['torch_dtype'] = config.torch_dtype
         self.cfg_dict = cfg_dict
@@ -48,53 +43,38 @@ class BenchmarkFixture:
         return 0
 
 
-
-
-class SimplifiedMLABencher(BenchmarkFixture):
-    def __init__(self, config: DeepseekV2Config, *args, **kwargs):
-        super().__init__(config, *args, **kwargs)
-        self.lora_rank = 128  # Use a smaller rank to avoid memory issues
-        
-        self.attn = SimplifiedMLA(
-            num_heads=config.num_attention_heads,
-            head_dim=config.hidden_size // config.num_attention_heads,
-            lora_rank=self.lora_rank,
-            dtype=config.torch_dtype
-        )
-        
-        # Create input tensors
-        self.hidden_state = torch.randn((self.bsz, config.hidden_size), 
-                                      dtype=config.torch_dtype, device='cuda')
-        
-        # Create compressed KV states - use a smaller kv_len if memory is an issue
-        kv_len = min(self.kv_len, 2048)  # Cap the kv_len to avoid memory issues
-        self.compressed_kv = torch.randn((self.bsz, kv_len, self.lora_rank),
-                                       dtype=config.torch_dtype, device='cuda')
-    
-    def iter(self):
-        return self.attn(self.hidden_state, self.compressed_kv)
-    
-    def cache_size(self):
-        return self.compressed_kv.numel() * self.compressed_kv.element_size()
-
-
-
 class SimpleAttentionBencher(BenchmarkFixture):
     def __init__(self, config: DeepseekV2Config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
+        
+        self.q_lora_rank = config.q_lora_rank if hasattr(config, 'q_lora_rank') else 1536
+        
         self.attn = SimpleAttention(
             num_heads=config.num_attention_heads,
             head_dim=config.hidden_size // config.num_attention_heads,
-            dtype=config.torch_dtype
-        ).cuda()
+            dtype=config.torch_dtype,
+            q_lora_rank=self.q_lora_rank,
+        ).to(self.dev)
         
         # Create input tensors
-        self.hidden_state = torch.randn((self.bsz, config.hidden_size), 
-                                      dtype=config.torch_dtype, device='cuda')
+        self.hidden_state = torch.randn(
+            (self.bsz, self.q_lora_rank),
+            dtype=config.torch_dtype, 
+            device=self.dev
+        )
         
         # Create key and value states
-        self.key_states = self.kv.repeat(self.bsz, 1, 1)
-        self.value_states = self.kv.repeat(self.bsz, 1, 1)
+        head_dim = config.hidden_size // config.num_attention_heads
+        self.key_states = torch.randn(
+            (self.bsz, self.kv_len, config.num_attention_heads, head_dim),
+            dtype=config.torch_dtype, 
+            device=self.dev
+        )
+        self.value_states = torch.randn(
+            (self.bsz, self.kv_len, config.num_attention_heads, head_dim),
+            dtype=config.torch_dtype, 
+            device=self.dev
+        )
     
     def iter(self):
         return self.attn(self.hidden_state, self.key_states, self.value_states)
@@ -102,25 +82,35 @@ class SimpleAttentionBencher(BenchmarkFixture):
     def cache_size(self):
         return (self.key_states.numel() + self.value_states.numel()) * self.key_states.element_size()
 
+
 class SimpleCompressedAttentionBencher(BenchmarkFixture):
     def __init__(self, config: DeepseekV2Config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
-        self.lora_rank = 512  # Can be adjusted as needed
+        
+        self.kv_lora_rank = config.kv_lora_rank if hasattr(config, 'kv_lora_rank') else 512
+        self.q_lora_rank = config.q_lora_rank if hasattr(config, 'q_lora_rank') else 1536
         
         self.attn = SimpleCompressedAttention(
             num_heads=config.num_attention_heads,
             head_dim=config.hidden_size // config.num_attention_heads,
-            lora_rank=self.lora_rank,
-            dtype=config.torch_dtype
-        ).cuda()
+            lora_rank=self.kv_lora_rank,
+            q_lora_rank=self.q_lora_rank,
+            dtype=config.torch_dtype,
+        ).to(self.dev)
         
         # Create input tensors
-        self.hidden_state = torch.randn((self.bsz, config.hidden_size), 
-                                      dtype=config.torch_dtype, device='cuda')
+        self.hidden_state = torch.randn(
+            (self.bsz, self.q_lora_rank),
+            dtype=config.torch_dtype, 
+            device=self.dev
+        )
         
         # Create compressed KV states
-        self.compressed_kv = torch.randn((self.bsz, self.kv_len, self.lora_rank),
-                                       dtype=config.torch_dtype, device='cuda')
+        self.compressed_kv = torch.randn(
+            (self.bsz, self.kv_len, self.kv_lora_rank),
+            dtype=config.torch_dtype, 
+            device=self.dev
+        )
     
     def iter(self):
         return self.attn(self.hidden_state, self.compressed_kv)
@@ -128,87 +118,47 @@ class SimpleCompressedAttentionBencher(BenchmarkFixture):
     def cache_size(self):
         return self.compressed_kv.numel() * self.compressed_kv.element_size()
 
-class SimpleAbsorbedAttention(torch.nn.Module):
-    def __init__(self, num_heads: int, head_dim: int, lora_rank: int, dtype=torch.float32):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.lora_rank = lora_rank
-        
-        # Create random weights for query projection
-        self.w_q = torch.nn.Linear(num_heads * head_dim, num_heads * head_dim, 
-                                 dtype=dtype, device='cuda')
-        
-        # Combined projection for compressed KV
-        self.kv_b_proj = torch.nn.Linear(lora_rank, 
-                                        num_heads * head_dim * 2,  # For both K and V
-                                        dtype=dtype, 
-                                        device='cuda')
-        
-        # Store dimensions for splitting
-        self.qk_head_dim = head_dim
-    
-    def forward(self, hidden_state: torch.Tensor, compressed_kv: torch.Tensor):
-        batch_size = hidden_state.size(0)
-        
-        # Split weights for query and value projections
-        kv_b_proj = self.kv_b_proj.weight.view(self.num_heads, -1, self.lora_rank)
-        # (num_heads, head_dim, lora_rank)
-        q_weights_proj = kv_b_proj[:, :self.qk_head_dim, :]  
-        v_weights_proj = kv_b_proj[:, self.qk_head_dim:, :] 
-        
-        # Project query
-        query = self.w_q(hidden_state).view(batch_size, self.num_heads, self.head_dim)
-        query = query.unsqueeze(2)  # (batch_size, num_heads, 1, head_dim)
-        
-        # Project query with compressed weights
-        # (batch_size, num_heads, 1, lora_rank)
-        query_absorbed = torch.matmul(query, q_weights_proj)  
-        
-        # Compute attention scores with compressed KV
-        # (batch_size, 1, seq_length, lora_rank)
-        compressed_kv = compressed_kv.unsqueeze(1)  
-        attn_weights = torch.matmul(query_absorbed, compressed_kv.transpose(-2, -1))
-        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-        
-        # (batch_size, num_heads, 1, lora_rank)
-        attn_output = torch.matmul(attn_weights, compressed_kv)
-        # (batch_size, num_heads, 1, head_dim)
-        attn_output = torch.matmul(attn_output, v_weights_proj.transpose(1, 2))  
-        
-        return attn_output
 
 class SimpleAbsorbedAttentionBencher(BenchmarkFixture):
     def __init__(self, config: DeepseekV2Config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
-        self.lora_rank = 512  # Can be adjusted as needed
+        
+        self.kv_lora_rank = config.kv_lora_rank if hasattr(config, 'kv_lora_rank') else 512
+        self.q_lora_rank = config.q_lora_rank if hasattr(config, 'q_lora_rank') else 1536
         
         self.attn = SimpleAbsorbedAttention(
             num_heads=config.num_attention_heads,
             head_dim=config.hidden_size // config.num_attention_heads,
-            lora_rank=self.lora_rank,
+            lora_rank=self.kv_lora_rank,
+            q_lora_rank=self.q_lora_rank,
             dtype=config.torch_dtype
-        ).cuda()
+        ).to(self.dev)
         
         # Create input tensors
-        self.hidden_state = torch.randn((self.bsz, config.hidden_size), 
-                                      dtype=config.torch_dtype, device='cuda')
+        self.hidden_state = torch.randn(
+            (self.bsz, self.q_lora_rank),
+            dtype=config.torch_dtype, 
+            device=self.dev
+        )
         
         # Create compressed KV states
-        self.compressed_kv = torch.randn((self.bsz, self.kv_len, self.lora_rank),
-                                       dtype=config.torch_dtype, device='cuda')
+        self.compressed_kv = torch.randn(
+            (self.bsz, self.kv_len, self.kv_lora_rank),
+            dtype=config.torch_dtype, 
+            device=self.dev
+        )
     
     def iter(self):
         return self.attn(self.hidden_state, self.compressed_kv)
     
     def cache_size(self):
         return self.compressed_kv.numel() * self.compressed_kv.element_size()
+
 
 ALL_BENCHMARKS = [
     SimpleAttentionBencher,
     SimpleCompressedAttentionBencher,
     SimpleAbsorbedAttentionBencher,
-    SimplifiedMLABencher,
 ]
 
 BENCHERS = {}
@@ -222,7 +172,8 @@ for bencher in ALL_BENCHMARKS:
     BENCHERS[short_name] = bencher
     doc += f'{short_name}\t{name}\n'
 
-def main(bench: str,  kv_len: int, bsz: int = 1, config: str = 'mla/config.json', repeat: Optional[int] = None, 
+
+def main(bench: str, kv_len: int, bsz: int = 1, config: str = 'mla/config.json', repeat: Optional[int] = None, 
          min_run_time: float = 1.0, csv: bool = False):
     cfg = DeepseekV2Config.from_json_file(config)
     bencher: BenchmarkFixture
@@ -246,6 +197,7 @@ def main(bench: str,  kv_len: int, bsz: int = 1, config: str = 'mla/config.json'
     print(f"Median: {result.median}")
     print(f"P25: {result._p25}")
     print(f"P75: {result._p75}")
+
 
 main.__doc__ = doc
 

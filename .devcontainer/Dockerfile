@@ -21,4 +21,4 @@ RUN apt-get update && apt-get install -y \
 RUN pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 
 # Optional: Add any other packages you need
-RUN pip3 install numpy pandas matplotlib jupyter transformers
+RUN pip3 install numpy pandas matplotlib jupyter transformers, fire

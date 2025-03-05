@@ -20,11 +20,11 @@ if torch.cuda.is_available():
 
 def run_benchmarks():
     # Sequence lengths to test (100, 316, 1000, 3162, 10000)
-    kv_lengths = [int(x) for x in np.logspace(2, 6, num=3)]
+    kv_lengths = [int(x) for x in np.logspace(2, 5.5, num=9)]
     batch_size = 32
     
     # Models to benchmark
-    models = ['SimpleAttention', 'SimpleCompressedAttention'] #'OptimizedMLA']
+    models = ['SimpleAttention', 'SimpleCompressedAttention', 'SimpleAbsorbedAttention']
     # Create results directory if it doesn't exist
     base_results_dir = "results"
     results_dir = os.path.join(base_results_dir, f"bsz-{batch_size}")
